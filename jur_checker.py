@@ -6,8 +6,10 @@ import pickle
 import hashlib
 import re
 import time
+import os
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timedelta
 
 # Third-party libraries for alias expansion
 import pymorphy3
@@ -20,6 +22,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Common Russian words for false positive detection (Observability feature)
+COMMON_RUSSIAN_WORDS = {
+    # Top 50 (ultra-common, definite false positives)
+    "и", "в", "не", "на", "с", "что", "а", "как", "по", "это",
+    "он", "она", "они", "к", "но", "за", "у", "от", "о", "из",
+    "для", "же", "до", "так", "мы", "вы", "я", "все", "был", "была",
+    "было", "были", "быть", "если", "есть", "когда", "где", "кто", "или",
+    "этот", "этого", "этой", "этих", "может", "можно", "нет", "да", "только",
+
+    # Top 51-100 (common, likely false positives)
+    "такой", "такая", "такое", "свой", "своя", "свое", "год", "день", "время",
+    "два", "три", "раз", "один", "одна", "одно", "много", "мало", "более",
+    "самый", "очень", "еще", "уже", "там", "здесь", "сейчас", "тогда", "потом",
+    "тут", "вот", "после", "через", "без", "под", "над", "между", "при",
+    "про", "нас", "вас", "них", "ним", "том", "тем", "которые", "который",
+    "стать", "сказать", "говорить", "видеть", "знать", "сделать", "хотеть"
+}
 
 
 class AliasExpander:
@@ -588,6 +608,9 @@ class JurChecker:
         else:
             logger.info("Сервис ЮРЧЕКЕР: поисковый движок загружен из кэша и готов к работе.")
 
+        # T014: Cleanup old telemetry logs on startup
+        self._cleanup_old_telemetry_logs()
+
     def _load_and_prepare_data(self, csv_path: str) -> dict:
         """
         Загружает данные из CSV, генерирует расширенные алиасы и наполняет
@@ -620,6 +643,7 @@ class JurChecker:
             return entity_map
 
         total_aliases_count = 0
+        alias_to_entities = {}  # Track collisions: alias -> set of entity_ids
 
         for index, row in df.iterrows():
             # Сохраняем полную информацию об объекте в виде словаря
@@ -635,6 +659,15 @@ class JurChecker:
             # Generate expanded aliases using AliasExpander with type-based strategy
             aliases = expander.expand_all(entity_name, entity_type)
 
+            # T007: Calculate alias quality metrics
+            single_word_aliases = [a for a in aliases if ' ' not in a and '.' not in a]
+            single_word_count = len(single_word_aliases)
+            is_person = expander.is_person_name(entity_name)
+
+            # Track collisions (will be analyzed after loop)
+            for alias in aliases:
+                alias_to_entities.setdefault(alias, set()).add(entity_id)
+
             # Add all aliases to automaton
             for alias in aliases:
                 self.automaton.add_word(alias, (alias, entity_data))
@@ -642,8 +675,38 @@ class JurChecker:
 
             total_aliases_count += len(aliases)
 
-            # Log alias count per entity (FR-017)
-            logger.info(f"Entity {entity_id}: {len(aliases)} aliases generated")
+            # T007: Log structured alias quality metrics (key=value format)
+            logger.info(
+                f"ALIAS_METRICS: entity_id={entity_id} entity_type={entity_type} "
+                f"alias_count={len(aliases)} single_word_count={single_word_count} "
+                f"is_person={is_person} collision_count=0"
+            )
+
+            # T008: Warn about single-word aliases from person names
+            if is_person and single_word_count > 0:
+                for alias in single_word_aliases:
+                    logger.warning(
+                        f"SINGLE_WORD_ALIAS: entity_id={entity_id} entity_name='{entity_name}' "
+                        f"alias='{alias}' risk=high"
+                    )
+
+            # T009: Warn about aliases matching common Russian words
+            for alias in aliases:
+                if alias in COMMON_RUSSIAN_WORDS:
+                    logger.warning(
+                        f"COMMON_WORD_ALIAS: entity_id={entity_id} entity_name='{entity_name}' "
+                        f"alias='{alias}' risk=very_high"
+                    )
+
+        # T010: Collision detection and warnings (after loop completes)
+        for alias, entity_ids in alias_to_entities.items():
+            if len(entity_ids) > 5:
+                risk = "high" if len(entity_ids) > 10 else "medium"
+                sample = list(entity_ids)[:10]
+                logger.warning(
+                    f"ALIAS_COLLISION: alias='{alias}' entity_count={len(entity_ids)} "
+                    f"risk={risk} sample_ids={sample}"
+                )
 
         # Calculate build time
         build_time = time.time() - build_start_time
@@ -681,23 +744,25 @@ class JurChecker:
 
     def _get_cache_path(self) -> Path:
         """
-        Возвращает путь к файлу кэша на основе имени CSV файла.
+        Возвращает путь к файлу кэша на основе имени CSV файла и режима строгости.
 
         Returns:
-            Path: Путь к файлу кэша.
+            Path: Путь к файлу кэша (mode-specific).
         """
         csv_name = Path(self.csv_path).stem
-        return self.cache_dir / f"{csv_name}_automaton.pkl"
+        mode = os.getenv("ALIAS_STRICTNESS", "strict")
+        return self.cache_dir / f"{csv_name}_{mode}_automaton.pkl"
 
     def _get_hash_path(self) -> Path:
         """
-        Возвращает путь к файлу с хэшем CSV.
+        Возвращает путь к файлу с хэшем CSV (mode-specific).
 
         Returns:
             Path: Путь к файлу с хэшем.
         """
         csv_name = Path(self.csv_path).stem
-        return self.cache_dir / f"{csv_name}_hash.txt"
+        mode = os.getenv("ALIAS_STRICTNESS", "strict")
+        return self.cache_dir / f"{csv_name}_{mode}_hash.txt"
 
     def _load_from_cache(self) -> bool:
         """
@@ -764,6 +829,46 @@ class JurChecker:
         except Exception as e:
             logger.error(f"Не удалось сохранить кэш: {e}")
 
+    def _get_telemetry_log_path(self) -> Path:
+        """
+        Returns path to today's telemetry log file.
+
+        Returns:
+            Path: Path to .logs/matches-{YYYY-MM-DD}.jsonl
+        """
+        logs_dir = Path(".logs")
+        today = datetime.now().strftime("%Y-%m-%d")
+        return logs_dir / f"matches-{today}.jsonl"
+
+    def _cleanup_old_telemetry_logs(self):
+        """
+        Deletes telemetry log files older than LOG_RETENTION_DAYS.
+        Runs once on startup to keep disk usage bounded.
+        """
+        logs_dir = Path(".logs")
+        if not logs_dir.exists():
+            return
+
+        retention_days = int(os.getenv("LOG_RETENTION_DAYS", "30"))
+        cutoff_date = datetime.now() - timedelta(days=retention_days)
+
+        deleted_count = 0
+        for log_file in logs_dir.glob("matches-*.jsonl"):
+            try:
+                # Extract date from filename: matches-2025-01-15.jsonl
+                date_str = log_file.stem.replace("matches-", "")
+                file_date = datetime.strptime(date_str, "%Y-%m-%d")
+
+                if file_date < cutoff_date:
+                    log_file.unlink()
+                    deleted_count += 1
+            except (ValueError, OSError) as e:
+                # Skip files that don't match expected format or can't be deleted
+                logger.warning(f"Could not process telemetry log {log_file}: {e}")
+
+        if deleted_count > 0:
+            logger.info(f"Cleaned up {deleted_count} old telemetry log files (retention: {retention_days} days)")
+
     def _normalize_text(self, text: str) -> str:
         """
         Приводит текст к единому виду для корректного поиска:
@@ -827,5 +932,29 @@ class JurChecker:
                 "context": context_snippet
             }
             candidates.append(candidate_info)
-            
+
+            # T013: Telemetry logging (if enabled)
+            if os.getenv("ENABLE_MATCH_LOGGING", "false").lower() == "true":
+                try:
+                    log_path = self._get_telemetry_log_path()
+
+                    # Truncate context to 300 chars for privacy
+                    truncated_context = context_snippet[:300]
+
+                    telemetry_entry = {
+                        "timestamp": datetime.now().isoformat() + "Z",
+                        "alias": found_keyword,
+                        "entity_id": entity_id,
+                        "entity_name": candidate_info["entity_name"],
+                        "entity_type": candidate_info["entity_type"],
+                        "context": truncated_context,
+                        "request_id": None
+                    }
+
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(telemetry_entry, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    # Never let telemetry errors break the main flow
+                    logger.warning(f"Failed to write telemetry log: {e}")
+
         return candidates

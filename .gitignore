@@ -56,3 +56,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Telemetry logs
+.logs/*.jsonl

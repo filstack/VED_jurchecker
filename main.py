@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import jur_checker  # Импортируем наш модуль
 import logging
+import os
 
 # Настройка логирования
 logging.basicConfig(
@@ -9,6 +10,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Environment variable configuration (Observability feature)
+ALIAS_STRICTNESS = os.getenv("ALIAS_STRICTNESS", "strict")
+if ALIAS_STRICTNESS not in {"strict", "balanced", "aggressive"}:
+    raise ValueError(f"Invalid ALIAS_STRICTNESS={ALIAS_STRICTNESS}, must be strict|balanced|aggressive")
+
+ENABLE_MATCH_LOGGING = os.getenv("ENABLE_MATCH_LOGGING", "false").lower() == "true"
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "30"))
+
+logger.info(f"Configuration loaded: ALIAS_STRICTNESS={ALIAS_STRICTNESS}, ENABLE_MATCH_LOGGING={ENABLE_MATCH_LOGGING}, LOG_RETENTION_DAYS={LOG_RETENTION_DAYS}")
 
 # --- Pydantic модели для валидации данных ---
 class TextIn(BaseModel):
@@ -70,4 +81,4 @@ def health_check():
     """Простой эндпоинт для проверки, что сервис жив."""
     if checker is None:
          raise HTTPException(status_code=503, detail="Сервис не здоров: реестр не загружен.")
-    return {"status": "ok"}
+    return {"status": "ok", "alias_mode": ALIAS_STRICTNESS}
