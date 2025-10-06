@@ -1,0 +1,480 @@
+{
+  "name": "Новый юрчекер",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://93.189.231.235:8001/check-candidates",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json[\"Текст\"] }) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -960,
+        -144
+      ],
+      "id": "52a281b9-b31f-487e-8d2a-99706fb76823",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -112,
+        80
+      ],
+      "id": "533bc542-b2af-4faa-a761-c6cfae64e7ec",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "Твоя роль: Сверхточный юрист-аналитик по комплаенсу в российском СМИ. Твоя главная задача — отсеивать ложные срабатывания, вызванные тем, что в качестве псевдонимов используются общие слова. Будь предельно скептичен.",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "=\nВот примеры правильных решений:\nПример 1:\n- Сущность: \"Фактограф\"\n- Псевдоним: \"факт\"\n- Контекст: \"...нужно доказать факт постоянного проживания...\"\n- Правильный ответ: {\"is_true_positive\": false, \"reason\": \"Слово 'факт' использовано в своем прямом лексическом значении, а не как название проекта.\"}\nПример 2:\n- Сущность: \"Перл Роман Александрович\"\n- Псевдоним: \"роман\"\n- Контекст: \"Автор статьи - Роман Романов...\"\n- Правильный ответ: {\"is_true_positive\": false, \"reason\": \"Слово 'Роман' является распространенным именем и в данном контексте относится к другому человеку.\"}\nПример 3:\n- Сущность: \"The Insider\"\n- Псевдоним: \"the insider\"\n- Контекст: \"...об этом сообщило издание The Insider...\"\n- Правильный ответ: {\"is_true_positive\": true, \"reason\": \"Контекст (упоминание 'издание') прямо указывает на СМИ с таким названием.\"}\n\nТеперь проанализируй реальные данные:\n\n- Сущность: \"{{$json.entity_name}}\"\n- Тип сущности: \"{{$json.entity_type}}\"\n- Найденный псевдоним: \"{{$json.found_alias}}\"\n- Контекст: \"{{$json.context}}\"\n\nВерни свой ответ СТРОГО в формате JSON:\n{\n  \"is_true_positive\": boolean, // true, только если ты на 99% уверен, что это реальное упоминание. Иначе — false.\n  \"is_distribution\": boolean, // true, только если тип сущности \"нежелательные\" И в тексте есть ЯВНЫЙ призыв к действию. Иначе — false.\n  \"reason\": \"Краткое и четкое обоснование твоего решения.\""
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        112,
+        80
+      ],
+      "id": "4a56bfca-291c-4d54-9e60-c803dff1b282",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = items[0];\nlet aiResponseText = item.json.text;\n\n// --- НОВЫЙ БЛОК ОЧИСТКИ ---\n// Некоторые модели оборачивают JSON в markdown.\n// Этот код находит и извлекает чистый JSON из такой строки.\nconst jsonMatch = aiResponseText.match(/```json\\n([\\s\\S]*?)\\n```/);\nif (jsonMatch && jsonMatch[1]) {\n  aiResponseText = jsonMatch[1];\n}\n// --- КОНЕЦ НОВОГО БЛОКА ---\n\ntry {\n  // Пытаемся распарсить ОЧИЩЕННЫЙ текст ответа\n  const parsedJson = JSON.parse(aiResponseText);\n  \n  // Добавляем к распарсенному JSON исходные данные кандидата\n  item.json.ai_verification = parsedJson;\n} catch (e) {\n  // Если ИИ вернул невалидный JSON даже после очистки\n  item.json.ai_verification = {\n    is_true_positive: false,\n    is_distribution: false,\n    reason: \"Ошибка парсинга ответа от ИИ: \" + aiResponseText\n  };\n}\n\nreturn item;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        208
+      ],
+      "id": "c145a764-ebc1-4147-a814-9fb988511242",
+      "name": "Parse AI Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Разбиваем payload на items по каждому candidate\n// Поддерживаем 3 случая:\n// 1) item.json = { candidates: [...] }\n// 2) item.json = \"[{...}]\" (JSON-строка)\n// 3) item.json = [{ candidates: [...] }] (массив-обертка)\n\nconst out = [];\n\nfor (const [i, item] of items.entries()) {\n  let payload = item.json;\n\n  // Если пришла строка — пробуем распарсить\n  if (typeof payload === 'string') {\n    try {\n      payload = JSON.parse(payload);\n    } catch (e) {\n      // не парсится — оставим как есть\n    }\n  }\n\n  // Если верхний уровень — массив (как в примере)\n  if (Array.isArray(payload)) {\n    for (const [j, wrapper] of payload.entries()) {\n      const candidates = (wrapper && Array.isArray(wrapper.candidates)) ? wrapper.candidates : [];\n      for (const [k, c] of candidates.entries()) {\n        out.push({\n          json: {\n            ...c, // entity_id, entity_name, entity_type, found_alias, context\n            source_item_index: i,\n            wrapper_index: j,\n            candidate_index: k,\n          },\n        });\n      }\n    }\n    continue;\n  }\n\n  // Если обычный объект с полем candidates\n  if (payload && Array.isArray(payload.candidates)) {\n    for (const [k, c] of payload.candidates.entries()) {\n      out.push({\n        json: {\n          ...c,\n          source_item_index: i,\n          candidate_index: k,\n        },\n      });\n    }\n    continue;\n  }\n\n  // Если candidates нет — просто пробрасываем\n  out.push({ json: payload });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -576,
+        -144
+      ],
+      "id": "fdf9922a-769f-47ce-99e6-97dc763ed089",
+      "name": "items"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        176,
+        -224
+      ],
+      "id": "5ad7739b-eace-40cb-af2f-f495e8e94ec8",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Вспомогалки ===\nconst safeLower = (s) => (typeof s === 'string' ? s.toLowerCase() : '');\nconst keyOf = (it) => it.entity_id && String(it.entity_id).length > 0\n  ? `id:${it.entity_id}`\n  : `name:${safeLower(it.entity_name || '')}`;\nconst toBool = (v) => (v === true || v === 'true'); // на случай строк \"true\"/\"false\"\nconst betterOf = (a, b) => {\n  const ca = (a.confidence ?? 0);\n  const cb = (b.confidence ?? 0);\n  if (cb > ca) return b;\n  if (cb < ca) return a;\n  if (!!b.is_distribution && !a.is_distribution) return b;\n  return a;\n};\n\n// === Читаем ИМЕННО вход этой Code-ноды (после Merge) ===\nconst all = $input.all().map(i => i.json);\n\nif (!all.length) {\n  return [{\n    json: {\n      status: '⚠️ PIPELINE_ERROR',\n      summary: 'На вход финальной ноды ничего не пришло (после Merge).',\n      details: []\n    }\n  }];\n}\n\n// Готовим список\nconst prepared = [];\nlet withVerification = 0;\n\nfor (const j of all) {\n  const v = j.ai_verification;\n  if (v) withVerification++;\n\n  if (!v) continue;\n  if (!toBool(v.is_true_positive)) continue;\n\n  prepared.push({\n    entity_id: j.entity_id ?? null,\n    entity_name: j.entity_name ?? null,\n    entity_type: j.entity_type ?? null,\n    found_alias: j.found_alias ?? null,\n    context_fragment: j.context ?? null,\n    is_distribution: toBool(v.is_distribution),\n    reason: v.reason ?? null,\n    confidence: (typeof v.confidence === 'number') ? v.confidence : null\n  });\n}\n\n// Если вообще нет ai_verification — это поломка до Merge\nif (withVerification === 0) {\n  return [{\n    json: {\n      status: '⚠️ PIPELINE_ERROR',\n      summary: 'После Merge у всех элементов отсутствует ai_verification. Проверь ветку к ИИ и склейку.',\n      details: []\n    }\n  }];\n}\n\n// Дедуп\nconst byKey = new Map();\nfor (const it of prepared) {\n  const k = keyOf(it);\n  if (!k || k === 'name:') continue;\n  const prev = byKey.get(k);\n  byKey.set(k, prev ? betterOf(prev, it) : it);\n}\nconst deduped = Array.from(byKey.values());\n\n// Сводка\nif (deduped.length === 0) {\n  return [{\n    json: {\n      status: '✅ OK',\n      summary: 'Нарушений или рисков не найдено.',\n      details: []\n    }\n  }];\n}\n\nconst total = deduped.length;\nconst uniqueEntities = new Set(\n  deduped.map(it => it.entity_id ? `id:${it.entity_id}` : `name:${safeLower(it.entity_name || '')}`)\n).size;\nconst distributions = deduped.filter(it => it.is_distribution).length;\nconst mentions = total - distributions;\n\nreturn [{\n  json: {\n    status: '⚠️ Риск/информ',\n    summary: `Найдено подтверждённых упоминаний: ${total} (уникальных сущностей: ${uniqueEntities}; распространение: ${distributions}; упоминания: ${mentions}).`,\n    details: deduped.map(it => ({\n      entity_id: it.entity_id,\n      entity_name: it.entity_name,\n      type: it.entity_type,\n      found_alias: it.found_alias,\n      is_distribution: it.is_distribution,\n      ai_reason: it.reason,\n      confidence: it.confidence,\n      context_fragment: it.context_fragment\n    }))\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -288
+      ],
+      "id": "525c7d7b-5ad6-4edf-aed3-6c1248f8be8d",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "model": "google/gemini-2.5-flash",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        192,
+        304
+      ],
+      "id": "17e93cdc-1c65-460e-b10f-a93082009de8",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "VonBdQoCx0vWMuYV",
+          "name": "ЮРЧЕКЕР"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## http://93.189.231.235:8001/docs\n/root/jurchecker_project/\n",
+        "height": 144,
+        "width": 496
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1200,
+        -512
+      ],
+      "typeVersion": 1,
+      "id": "9793d96c-315f-4f1d-bc66-da197537dd72",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Этот код находит массив 'candidates' и очищает его от дубликатов.\n// Он устойчив к разным форматам входных данных.\n\nconst item = items[0];\nlet candidates = [];\n\n// Проверяем несколько возможных путей, где могут быть кандидаты\nif (item.json.body && Array.isArray(item.json.body.candidates)) {\n  // Случай, когда ответ от HTTP Request обернут в body\n  candidates = item.json.body.candidates;\n} else if (Array.isArray(item.json.candidates)) {\n  // Случай, когда candidates лежат прямо в json\n  candidates = item.json.candidates;\n} else {\n  // Если кандидаты не найдены, возвращаем пустой результат\n  return [{ json: { candidates: [] } }];\n}\n\n\nif (candidates.length === 0) {\n  return [{ json: { candidates: [] } }];\n}\n\n// Сортируем кандидатов от самого длинного псевдонима к самому короткому\ncandidates.sort((a, b) => b.found_alias.length - a.found_alias.length);\n\nconst final_candidates = [];\nconst processed_contexts = new Set(); // Используем Set для более эффективной проверки\n\nfor (const current_candidate of candidates) {\n  // Проверяем, не обрабатывали ли мы уже этот фрагмент текста\n  if (processed_contexts.has(current_candidate.context)) {\n    continue;\n  }\n\n  let is_duplicate_or_subset = false;\n\n  // Проверяем, не является ли текущий кандидат частью уже добавленного, более длинного\n  for (const final_item of final_candidates) {\n    if (final_item.context.includes(current_candidate.context) && \n        final_item.found_alias.includes(current_candidate.found_alias)) {\n      is_duplicate_or_subset = true;\n      break;\n    }\n  }\n\n  if (!is_duplicate_or_subset) {\n    final_candidates.push(current_candidate);\n    processed_contexts.add(current_candidate.context);\n  }\n}\n\n// Возвращаем очищенный и отсортированный список\nreturn [{ json: { candidates: final_candidates } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -768,
+        -144
+      ],
+      "id": "184b3f8f-b581-46cc-9a61-8fd833451e2d",
+      "name": "Deduplicate & Prioritize"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        464,
+        -288
+      ],
+      "id": "09a5d30d-7111-4a81-a608-2fe2f5de04ba",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cbc06779-2c6b-460d-8803-e96716068e6d",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1360,
+        -144
+      ],
+      "id": "19c21e2f-7bed-4569-b381-a3c98437554a",
+      "name": "Webhook1",
+      "webhookId": "cbc06779-2c6b-460d-8803-e96716068e6d"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=Результаты проверки:\n\n{{ $json.summary }}\n\n⚠️ Объект: {{ $json.details[0].entity_name }}\n📌 Причина: {{ $json.details[0].ai_reason }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        880,
+        -288
+      ],
+      "id": "fa0cab4e-9851-4e2f-8249-945a19fa0982",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1VkLbc5n_UkeNV4vnErGUkiM-hmHXPWMvqCrlwQqXmXE",
+          "mode": "list",
+          "cachedResultName": "Статистика юрчекер",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1VkLbc5n_UkeNV4vnErGUkiM-hmHXPWMvqCrlwQqXmXE/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Лист1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1VkLbc5n_UkeNV4vnErGUkiM-hmHXPWMvqCrlwQqXmXE/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Текст": "={{ $json.body.text }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Дата",
+              "displayName": "Дата",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Текст",
+              "displayName": "Текст",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Результат ",
+              "displayName": "Результат ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -1152,
+        -144
+      ],
+      "id": "3977b6db-20a1-41f9-bb0e-20640416a079",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "k2BfOTw7PmrQtmSa",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook1": [
+      {
+        "json": {
+          "headers": {
+            "host": "n8n.flowzilla.ru",
+            "x-forwarded-scheme": "https",
+            "x-forwarded-proto": "https",
+            "x-forwarded-for": "185.174.40.67",
+            "x-real-ip": "185.174.40.67",
+            "content-length": "56",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+            "accept": "*/*",
+            "accept-language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "referer": "https://justphil0702-lawchecker.static.hf.space/",
+            "content-type": "application/json",
+            "origin": "https://justphil0702-lawchecker.static.hf.space",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "priority": "u=0"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "text": "фонд борьбы с коррупцией"
+          },
+          "webhookUrl": "https://n8n.flowzilla.ru/webhook/cbc06779-2c6b-460d-8803-e96716068e6d",
+          "executionMode": "production"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Deduplicate & Prioritize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Operation, do nothing": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deduplicate & Prioritize": {
+      "main": [
+        [
+          {
+            "node": "items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "40594753-856c-4727-af89-00033a1f4faa",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "bffad4c9f83acfd6463e64d51eb0cabef751637efb0493829ed8453fbbddb165"
+  },
+  "id": "ZcJPa2ycGR9Q6sN3",
+  "tags": []
+}
