@@ -38,8 +38,51 @@ COMMON_RUSSIAN_WORDS = {
     "самый", "очень", "еще", "уже", "там", "здесь", "сейчас", "тогда", "потом",
     "тут", "вот", "после", "через", "без", "под", "над", "между", "при",
     "про", "нас", "вас", "них", "ним", "том", "тем", "которые", "который",
-    "стать", "сказать", "говорить", "видеть", "знать", "сделать", "хотеть"
+    "стать", "сказать", "говорить", "видеть", "знать", "сделать", "хотеть",
+
+    # Abbreviations & prepositions causing false positives
+    "со", "во", "ко", "об", "со", "то", "бы", "ли", "ни", "же",
+    "ст", "ук", "рф", "км", "дон", "тр", "вс", "гг", "мид",
+
+    # Common words from entity names
+    "группа", "центр", "фонд", "союз", "комитет", "движение", "партия",
+    "издание", "агентство", "первый", "второй", "развитие", "поддержка",
+    "альянс", "команда", "проект", "отдел", "факт", "выбор", "инициатива",
+    "весь", "вся", "все", "ноги", "вот", "максим", "сергей", "александр",
+    "николай", "союзники", "исключение", "великобритания", "настоящее",
+    "время", "мемориал", "сейчас"
 }
+
+def is_dangerous_alias(alias: str) -> bool:
+    """
+    Проверяет, является ли алиас опасным (высокий риск ложных срабатываний).
+
+    Опасные алиасы:
+    - Очень короткие (< 3 символов)
+    - Частые русские слова (предлоги, союзы, местоимения)
+    - Однобуквенные аббревиатуры
+
+    Args:
+        alias: Нормализованный алиас для проверки
+
+    Returns:
+        True если алиас опасен, False если безопасен
+    """
+    alias_lower = alias.lower().strip()
+
+    # Критерий 1: Слишком короткие (< 3 символов)
+    if len(alias_lower) < 3:
+        return True
+
+    # Критерий 2: В списке частых слов
+    if alias_lower in COMMON_RUSSIAN_WORDS:
+        return True
+
+    # Критерий 3: Только цифры или только точки
+    if alias_lower.replace('.', '').replace(' ', '').isdigit():
+        return True
+
+    return False
 
 
 class AliasExpander:
@@ -661,9 +704,16 @@ class JurChecker:
                 try:
                     # Use pre-generated aliases from CSV (JSON format)
                     aliases_raw = json.loads(entity_data['aliases'])
-                    # Normalize all pre-generated aliases
-                    aliases = [expander.normalize_alias(a) for a in aliases_raw if a]
-                    logger.debug(f"Using {len(aliases)} pre-generated aliases for entity_id={entity_id}")
+                    # Normalize and filter dangerous aliases
+                    aliases_normalized = [expander.normalize_alias(a) for a in aliases_raw if a]
+                    aliases_before = len(aliases_normalized)
+                    aliases = [a for a in aliases_normalized if not is_dangerous_alias(a)]
+                    filtered_count = aliases_before - len(aliases)
+
+                    if filtered_count > 0:
+                        logger.debug(f"Filtered {filtered_count} dangerous aliases for entity_id={entity_id}")
+
+                    logger.debug(f"Using {len(aliases)} safe pre-generated aliases for entity_id={entity_id}")
                 except (json.JSONDecodeError, TypeError, ValueError) as e:
                     # Fallback: generate aliases if JSON parsing fails
                     logger.warning(f"Failed to parse aliases for entity_id={entity_id}: {e}. Generating aliases.")
