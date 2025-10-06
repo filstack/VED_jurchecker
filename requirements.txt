@@ -3,3 +3,7 @@ uvicorn[standard]==0.30.0
 pandas==2.2.0
 pyahocorasick==2.1.0
 pydantic==2.9.0
+pymorphy3==1.2.0
+petrovich==2.0.1
+transliterate==1.10.2
+pytest==8.0.0
