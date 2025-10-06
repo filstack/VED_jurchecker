@@ -656,8 +656,22 @@ class JurChecker:
             if not entity_name:
                 continue  # Skip empty names
 
-            # Generate expanded aliases using AliasExpander with type-based strategy
-            aliases = expander.expand_all(entity_name, entity_type)
+            # Check if CSV has pre-generated aliases column
+            if 'aliases' in entity_data and entity_data['aliases']:
+                try:
+                    # Use pre-generated aliases from CSV (JSON format)
+                    aliases_raw = json.loads(entity_data['aliases'])
+                    # Normalize all pre-generated aliases
+                    aliases = [expander.normalize_alias(a) for a in aliases_raw if a]
+                    logger.debug(f"Using {len(aliases)} pre-generated aliases for entity_id={entity_id}")
+                except (json.JSONDecodeError, TypeError, ValueError) as e:
+                    # Fallback: generate aliases if JSON parsing fails
+                    logger.warning(f"Failed to parse aliases for entity_id={entity_id}: {e}. Generating aliases.")
+                    aliases = expander.expand_all(entity_name, entity_type)
+            else:
+                # Generate expanded aliases using AliasExpander with type-based strategy
+                logger.debug(f"No pre-generated aliases found for entity_id={entity_id}. Generating aliases.")
+                aliases = expander.expand_all(entity_name, entity_type)
 
             # T007: Calculate alias quality metrics
             single_word_aliases = [a for a in aliases if ' ' not in a and '.' not in a]
