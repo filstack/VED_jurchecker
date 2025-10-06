@@ -28,6 +28,12 @@ class AliasExpander:
 
     Handles: name orders, initials, morphological forms, diminutives, transliterations.
     Implements: FR-001 through FR-021.
+
+    Type-based strategies to reduce false positives:
+    - террористы: exact match + abbreviations
+    - экстремисты: full names + morphology
+    - нежелательные: exact match (Cyrillic/Latin)
+    - иноагенты: smart (person names get full expansion, organizations get strict)
     """
 
     def __init__(self, max_aliases: int = 100):
@@ -77,6 +83,66 @@ class AliasExpander:
             "ирина": ["ира", "ирка"],
             "екатерина": ["катя", "катюша", "катька"],
         }
+
+    def is_person_name(self, name: str) -> bool:
+        """
+        Determine if entity name is a person (ФИО) or organization.
+
+        Args:
+            name: Entity name from CSV
+
+        Returns:
+            True if person name, False if organization
+        """
+        name_lower = name.lower()
+        words = name.split()
+
+        # 1. Organization keywords (clear indicators)
+        ORG_KEYWORDS = {
+            'фонд', 'организация', 'общество', 'проект', 'издание',
+            'движение', 'союз', 'партнерство', 'центр', 'институт',
+            'комитет', 'ано', 'оао', 'ооо', 'нко', 'автономная',
+            'некоммерческая', 'благотворительный', 'региональн',
+            'межрегиональн', 'общероссийск', 'объединение',
+            'группа', 'компания', 'корпорация', 'ассоциация',
+            'террористическ', 'экстремистск', 'сообщество'
+        }
+
+        if any(kw in name_lower for kw in ORG_KEYWORDS):
+            return False  # Organization
+
+        # 2. Person name indicators (patronymic endings)
+        PATRONYMIC_ENDINGS = ('ович', 'евич', 'овна', 'евна', 'ичем', 'ична')
+
+        for word in words:
+            word_lower = word.lower()
+            # Check patronymic (must be longer than 5 chars to avoid false matches)
+            if len(word) > 5 and any(word_lower.endswith(end) for end in PATRONYMIC_ENDINGS):
+                return True  # Person with patronymic
+
+        # 3. Heuristics by word count
+        if len(words) == 2:
+            # "Захаров Андрей" or "Кедр.медиа" or "Исламское государство"?
+            # Check if both words look like typical Russian surnames/names (capitalized, Cyrillic)
+            # Exclude common organization patterns like "Исламское государство"
+            common_org_words = {'государство', 'движение', 'сообщество', 'коммунистическ'}
+            if any(org_word in name_lower for org_word in common_org_words):
+                return False  # Organization pattern
+
+            # If no dots/digits → likely person name
+            if '.' not in name and not any(char.isdigit() for char in name):
+                return True
+
+        if len(words) == 3:
+            # "Захаров Андрей Вячеславович" or "Михнов-Вайтенко Григорий Александрович"
+            # Check for hyphenated surnames (common in person names)
+            if any('-' in word for word in words[:2]):
+                return True
+            # Three words without org keywords → likely person
+            return True
+
+        # 4. Default: organization
+        return False
 
     def parse_person_name(self, name: str) -> tuple:
         """
@@ -335,16 +401,104 @@ class AliasExpander:
         # Truncate to max (simple strategy: keep first N, which are already prioritized by generation order)
         return aliases[:self.max_aliases]
 
-    def expand_all(self, entity_name: str) -> list:
+    def expand_all(self, entity_name: str, entity_type: str = "иноагенты") -> list:
         """
-        Generate all alias variants for an entity.
+        Generate all alias variants for an entity using type-based strategies.
 
         Args:
-            entity_name: Full entity name from CSV (e.g., "Алексей Анатольевич Навальный")
+            entity_name: Full entity name from CSV
+            entity_type: Type of entity (террористы, экстремисты, нежелательные, иноагенты)
 
         Returns:
             List of normalized, deduplicated aliases (length ≤ max_aliases)
         """
+        # Type-based expansion strategies
+        if entity_type == "террористы":
+            return self._expand_terrorist(entity_name)
+        elif entity_type == "экстремисты":
+            return self._expand_extremist(entity_name)
+        elif entity_type == "нежелательные":
+            return self._expand_undesirable(entity_name)
+        else:  # иноагенты or default
+            return self._expand_foreign_agent(entity_name)
+
+    def _expand_terrorist(self, entity_name: str) -> list:
+        """
+        Strategy for terrorists: exact match + known abbreviations only.
+        No morphology to avoid false positives.
+        """
+        normalized = self.normalize_alias(entity_name)
+        aliases = [normalized]
+
+        # Add common terrorist abbreviations if present
+        if "исламское государство" in normalized or "игил" in normalized:
+            aliases.extend(["игил", "иг", "isis", "isil", "даиш"])
+        if "аль-каида" in normalized or "аль каида" in normalized:
+            aliases.extend(["аль-каида", "аль каида", "al-qaeda", "al qaeda"])
+        if "талибан" in normalized:
+            aliases.extend(["талибан", "taliban"])
+
+        return list(set(aliases))
+
+    def _expand_extremist(self, entity_name: str) -> list:
+        """
+        Strategy for extremists: full name + morphology only.
+        No single-word extraction to reduce false positives.
+        """
+        normalized = self.normalize_alias(entity_name)
+        aliases = [normalized]
+
+        # Add morphological forms of the full name (if Russian)
+        words = entity_name.split()
+        if len(words) > 0:
+            # Get morphology for last significant word (usually the key term)
+            last_word = words[-1]
+            morpho_forms = self.expand_morphological_forms(last_word)
+
+            # Reconstruct full phrases with morphological variants
+            for form in morpho_forms:
+                # Replace last word with morphological form
+                variant_words = words[:-1] + [form]
+                variant = " ".join(variant_words)
+                aliases.append(self.normalize_alias(variant))
+
+        return list(set(aliases))
+
+    def _expand_undesirable(self, entity_name: str) -> list:
+        """
+        Strategy for undesirable orgs: exact match only (Cyrillic + Latin variants).
+        Many have Latin names, just normalize.
+        """
+        normalized = self.normalize_alias(entity_name)
+        aliases = [normalized]
+
+        # If contains parentheses with translation, extract both
+        # Example: "Greenpeace International (Гринпис Интернешнл)"
+        if '(' in entity_name and ')' in entity_name:
+            # Extract text in parentheses
+            import re
+            match = re.search(r'\(([^)]+)\)', entity_name)
+            if match:
+                alternate = match.group(1)
+                aliases.append(self.normalize_alias(alternate))
+
+        return list(set(aliases))
+
+    def _expand_foreign_agent(self, entity_name: str) -> list:
+        """
+        Strategy for foreign agents: smart detection (person vs organization).
+        - Person names: full expansion (morphology, initials, diminutives, transliteration)
+        - Organizations: strict (full name only, no single-word extraction)
+        """
+        if self.is_person_name(entity_name):
+            # Full expansion for person names
+            return self._expand_person_name(entity_name)
+        else:
+            # Strict expansion for organizations (just full name + morphology of full phrase)
+            return self._expand_organization_name(entity_name)
+
+    def _expand_person_name(self, entity_name: str) -> list:
+        """Full alias expansion for person names (original logic)."""
         all_variants = []
 
         # Parse name
@@ -389,6 +543,14 @@ class AliasExpander:
         final_aliases = self.prioritize_aliases(unique_variants)
 
         return final_aliases
+
+    def _expand_organization_name(self, entity_name: str) -> list:
+        """
+        Strict expansion for organizations: only full name (no single words).
+        Reduces false positives on common words like "проект", "центр", etc.
+        """
+        normalized = self.normalize_alias(entity_name)
+        return [normalized]
 
 class JurChecker:
     """
@@ -465,12 +627,13 @@ class JurChecker:
             entity_id = entity_data.get('id', f'unknown_{index}')
             # Поддержка обоих форматов CSV: 'entity_name' или 'name'
             entity_name = str(entity_data.get('entity_name', entity_data.get('name', ''))).strip()
+            entity_type = str(entity_data.get('type', 'иноагенты')).strip()
 
             if not entity_name:
                 continue  # Skip empty names
 
-            # Generate expanded aliases using AliasExpander
-            aliases = expander.expand_all(entity_name)
+            # Generate expanded aliases using AliasExpander with type-based strategy
+            aliases = expander.expand_all(entity_name, entity_type)
 
             # Add all aliases to automaton
             for alias in aliases:
