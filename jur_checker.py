@@ -375,10 +375,17 @@ class AliasExpander:
         # 6. Normalize all variants
         normalized_variants = [self.normalize_alias(v) for v in all_variants]
 
-        # 7. Deduplicate
-        unique_variants = list(set(normalized_variants))
+        # 7. Filter out very short aliases (< 4 symbols) to reduce false positives
+        # Exception: keep initials (contain dots)
+        filtered_variants = [
+            v for v in normalized_variants
+            if len(v) >= 4 or '.' in v
+        ]
 
-        # 8. Prioritize and truncate
+        # 8. Deduplicate
+        unique_variants = list(set(filtered_variants))
+
+        # 9. Prioritize and truncate
         final_aliases = self.prioritize_aliases(unique_variants)
 
         return final_aliases
