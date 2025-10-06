@@ -1,7 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(uvx:*)"
+      "Bash(uvx:*)",
+      "Bash(powershell:*)",
+      "Bash(git checkout:*)",
+      "Bash(pytest:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote add origin https://github.com/filstack/VED_jurchecker.git)"
     ],
     "deny": [],
     "ask": []
