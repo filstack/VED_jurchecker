@@ -15,28 +15,33 @@ import time
 # API endpoint (remote server)
 API_URL = "http://93.189.231.235:8021/check-candidates"
 
-def load_texts_from_excel(filepath, max_texts=50):
+def load_texts_from_excel(filepath, max_texts=50, skip_texts=0):
     """Загружает тексты из Excel файла"""
     print(f"[FILE] Открываю файл: {filepath}")
     wb = openpyxl.load_workbook(filepath, read_only=True)
     sheet = wb.active
 
     texts = []
+    skipped = 0
     for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
-        if len(texts) >= max_texts:
-            break
-
         # Берем текст из 6-й колонки (индекс 5) - там основной контент
         if len(row) > 5 and row[5]:
             text = str(row[5])
             if len(text) > 50:  # Минимум 50 символов
+                if skipped < skip_texts:
+                    skipped += 1
+                    continue
+
+                if len(texts) >= max_texts:
+                    break
+
                 texts.append({
                     'row': row_idx,
                     'text': text[:5000],  # Обрезаем очень длинные тексты
                     'length': len(text)
                 })
 
-    print(f"[OK] Загружено {len(texts)} текстов")
+    print(f"[OK] Загружено {len(texts)} текстов (пропущено первых: {skip_texts})")
     print(f"[STAT] Средняя длина: {sum(t['length'] for t in texts) / len(texts):.0f} символов")
     return texts
 
@@ -51,10 +56,11 @@ def test_current_api(texts):
 
     for idx, item in enumerate(texts, 1):
         text = item['text']
+        print(f"  [{idx}/{len(texts)}] Обработка строки {item['row']}...", end='', flush=True)
 
         try:
             start = time.time()
-            response = requests.post(API_URL, json={"text": text}, timeout=10)
+            response = requests.post(API_URL, json={"text": text}, timeout=30)
             elapsed = time.time() - start
             total_time += elapsed
 
@@ -76,13 +82,16 @@ def test_current_api(texts):
                     entity_counter[c['entity_name']] += 1
                     alias_counter[c['found_alias']] += 1
 
-                if idx % 10 == 0:
-                    print(f"  Обработано: {idx}/{len(texts)}")
+                print(f" OK ({len(candidates)} найдено, {elapsed:.2f}s)")
             else:
-                print(f"  [ERROR] Ошибка в строке {item['row']}: HTTP {response.status_code}")
+                print(f" [ERROR] HTTP {response.status_code}")
 
+        except requests.exceptions.Timeout:
+            print(f" [TIMEOUT] Превышен таймаут 30s")
+        except requests.exceptions.ConnectionError as e:
+            print(f" [CONNECTION ERROR] {e}")
         except Exception as e:
-            print(f"  [ERROR] Ошибка в строке {item['row']}: {e}")
+            print(f" [ERROR] {e}")
 
     # Итоговая статистика
     total_matches = sum(r['found_count'] for r in results)
@@ -140,8 +149,8 @@ def main():
     print("МАССОВОЕ ТЕСТИРОВАНИЕ JURCHECKER")
     print("=" * 80)
 
-    # Загружаем тексты
-    texts = load_texts_from_excel("output (2).xlsx", max_texts=20)
+    # Загружаем тексты (пропускаем первые 200, берем следующие 300)
+    texts = load_texts_from_excel("output (2).xlsx", max_texts=300, skip_texts=200)
 
     if not texts:
         print("[ERROR] Не удалось загрузить тексты из файла")
@@ -158,7 +167,7 @@ def main():
     print("=" * 80)
 
     # Сохраняем детальные результаты
-    with open('test_results.json', 'w', encoding='utf-8') as f:
+    with open('test_results_batch2.json', 'w', encoding='utf-8') as f:
         json.dump({
             'summary': {
                 'total_texts': len(texts),
@@ -172,7 +181,7 @@ def main():
             'detailed_results': current_results['results']
         }, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[SAVED] Детальные результаты сохранены в: test_results.json")
+    print(f"\n[SAVED] Детальные результаты сохранены в: test_results_batch2.json")
 
 if __name__ == "__main__":
     main()
