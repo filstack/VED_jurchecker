@@ -723,43 +723,61 @@ class AliasExpander:
             return self._expand_organization_name(entity_name)
 
     def _expand_person_name(self, entity_name: str) -> list:
-        """Full alias expansion for person names (original logic)."""
+        """
+        Full alias expansion for person names (ФИО).
+
+        CRITICAL FIX: НЕ генерируем склонения для отдельных частей имени.
+        Генерируем только склонения ПОЛНЫХ имен (Имя Фамилия, Имя Отчество Фамилия).
+        """
         all_variants = []
 
         # Parse name
         first, patronymic, last = self.parse_person_name(entity_name)
 
         # 1. Name orders (FR-001, FR-004)
-        all_variants.extend(self.expand_name_orders(first, patronymic, last))
+        name_order_variants = self.expand_name_orders(first, patronymic, last)
+        all_variants.extend(name_order_variants)
 
         # 2. Initials (FR-002, FR-003)
         all_variants.extend(self.expand_initials(first, patronymic, last))
 
-        # 3. Morphological forms for surname (FR-011, FR-012)
-        morphological_forms = self.expand_morphological_forms(last)
-
-        # Apply heuristic fallback if morphology failed (FR-008, FR-009, FR-010)
-        morphological_forms = self.apply_heuristic_fallback(last, morphological_forms)
-
-        all_variants.extend(morphological_forms)
+        # 3. Morphological forms for FULL NAME ONLY (не для отдельных слов!)
+        # Склоняем только полные варианты имен (2-3 слова), не фамилию/отчество отдельно
+        for name_variant in name_order_variants:
+            words = name_variant.split()
+            if len(words) >= 2:
+                # Склоняем словосочетание (Имя Фамилия или Имя Отчество Фамилия)
+                morpho_forms = self.expand_phrase_morphology(name_variant, max_words=3)
+                all_variants.extend(morpho_forms)
 
         # 4. Diminutives for first name (FR-005)
+        # ТОЛЬКО в комбинации с фамилией, не отдельно
         diminutives = self.expand_diminutives(first)
-        all_variants.extend(diminutives)
+        for dim in diminutives:
+            if patronymic:
+                all_variants.append(f"{dim} {patronymic} {last}")
+            all_variants.append(f"{dim} {last}")
 
         # 5. Transliterations (FR-006, FR-007)
+        # Транслитерируем только полные имена, не отдельные слова
         transliterations = self.expand_transliterations(all_variants)
         all_variants.extend(transliterations)
 
         # 6. Normalize all variants
         normalized_variants = [self.normalize_alias(v) for v in all_variants]
 
-        # 7. Filter out very short aliases (< 4 symbols) to reduce false positives
-        # Exception: keep initials (contain dots)
-        filtered_variants = [
-            v for v in normalized_variants
-            if len(v) >= 4 or '.' in v
-        ]
+        # 7. Filter out single words (except initials with dots)
+        # ЭТО КРИТИЧНО: убираем все однословные алиасы (николаевна, николаевну и т.д.)
+        filtered_variants = []
+        for v in normalized_variants:
+            # Оставляем только:
+            # - Инициалы с точками (а. навальный)
+            # - Многословные имена (2+ слов)
+            if '.' in v:
+                filtered_variants.append(v)
+            elif len(v.split()) >= 2:
+                filtered_variants.append(v)
+            # Однословные алиасы УДАЛЯЕМ полностью
 
         # 8. Deduplicate
         unique_variants = list(set(filtered_variants))
