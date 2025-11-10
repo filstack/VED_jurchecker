@@ -50,16 +50,17 @@ COMMON_RUSSIAN_WORDS = {
     "альянс", "команда", "проект", "отдел", "факт", "выбор", "инициатива",
     "весь", "вся", "все", "ноги", "вот", "максим", "сергей", "александр",
     "николай", "союзники", "исключение", "великобритания", "настоящее",
-    "время", "мемориал", "сейчас",
+    "время", "мемориал", "сейчас", "объединение",
 
     # Common words causing false positives (from 500-text analysis)
-    "россия", "вместе", "процесс", "другой", "наши", "друг", "собеседник",
+    "россия", "россии", "россию", "россией", "вместе", "процесс", "другой", "наши", "друг", "собеседник",
     "голосов", "городской", "научный", "выборы", "акцент", "граждане",
 
     # Common first names (high false positive risk)
     "андрей", "михаил", "антон", "олег", "татьяна", "роман", "илья",
     "виктор", "александра", "роберт", "дарья", "анастасия", "евгений",
     "дмитрий", "алексей", "иван", "петр", "павел", "юрий", "владимир",
+    "игорь", "сергей", "николай", "максим",
 
     # Common patronymics (from hard test)
     "петрович", "александрович", "иванович", "сергеевич", "владимирович",
@@ -523,55 +524,168 @@ class AliasExpander:
         Returns:
             List of normalized, deduplicated aliases (length ≤ max_aliases)
         """
-        # Type-based expansion strategies
-        if entity_type == "террористы":
+        # ВАЖНО: Для ЛЮДЕЙ используем полную стратегию расширения имен, независимо от типа
+        if self.is_person_name(entity_name):
+            return self._expand_person_name(entity_name)
+
+        # Type-based expansion strategies для организаций
+        if "террорист" in entity_type.lower():
             return self._expand_terrorist(entity_name)
-        elif entity_type == "экстремисты":
+        elif "экстремист" in entity_type.lower():
             return self._expand_extremist(entity_name)
-        elif entity_type == "нежелательные":
+        elif "нежелательн" in entity_type.lower():
             return self._expand_undesirable(entity_name)
         else:  # иноагенты or default
-            return self._expand_foreign_agent(entity_name)
+            return self._expand_organization_name(entity_name)
+
+    def expand_phrase_morphology(self, phrase: str, max_words: int = 3) -> list:
+        """
+        Склоняет словосочетание (прилагательное + существительное) с согласованием.
+
+        Пример: "правый сектор" → ["правый сектор", "правого сектора", "правому сектору", ...]
+
+        Args:
+            phrase: Словосочетание для склонения (последние 1-3 слова)
+            max_words: Максимум слов для склонения (по умолчанию 3)
+
+        Returns:
+            Список склоненных форм
+        """
+        words = phrase.split()
+        if len(words) == 0:
+            return []
+
+        # Берем только последние max_words слов (чтобы не склонять длинные названия целиком)
+        words = words[-max_words:]
+
+        if len(words) == 1:
+            # Одно слово — просто склоняем
+            return self.expand_morphological_forms(words[0])
+
+        # Несколько слов — склоняем с согласованием
+        # Разбираем слова
+        parsed_words = []
+        for word in words:
+            parsed = self.morph_analyzer.parse(word)
+            if parsed:
+                parsed_words.append(parsed[0])
+            else:
+                # Если слово не распознано, возвращаем пустой список
+                return []
+
+        if not parsed_words:
+            return []
+
+        # Определяем главное слово (обычно последнее — существительное)
+        main_word = parsed_words[-1]
+
+        # Генерируем формы
+        variants = set()
+
+        # Для каждого падежа главного слова
+        for main_form in main_word.lexeme:
+            # Согласуем остальные слова
+            inflected_words = []
+
+            # Согласуем зависимые слова (прилагательные)
+            for i, parsed_word in enumerate(parsed_words[:-1]):
+                # Пытаемся согласовать с главным словом
+                # Берем род, число, падеж главного слова
+                grammemes = {main_form.tag.case, main_form.tag.gender, main_form.tag.number}
+                # Удаляем None
+                grammemes = {g for g in grammemes if g}
+
+                inflected = parsed_word.inflect(grammemes)
+                if inflected:
+                    inflected_words.append(inflected.word.lower())
+                else:
+                    # Если не удалось согласовать, берем исходное слово
+                    inflected_words.append(words[i].lower())
+
+            # Добавляем главное слово
+            inflected_words.append(main_form.word.lower())
+
+            # Собираем словосочетание
+            variant = " ".join(inflected_words)
+            variants.add(variant)
+
+        return list(variants)
 
     def _expand_terrorist(self, entity_name: str) -> list:
         """
-        Strategy for terrorists: exact match + known abbreviations only.
-        No morphology to avoid false positives.
+        Strategy for terrorists: exact match + known abbreviations + morphology for key terms.
+        Добавлено склонение для последних 1-2 слов названия.
         """
         normalized = self.normalize_alias(entity_name)
         aliases = [normalized]
 
+        # Add morphological forms for key phrase (last 1-2 words)
+        words = entity_name.split()
+        if len(words) >= 2:
+            # Склоняем последние 2 слова (например, "Исламское государство")
+            key_phrase = " ".join(words[-2:])
+            morpho_forms = self.expand_phrase_morphology(key_phrase, max_words=2)
+
+            # Добавляем полные и короткие формы
+            prefix = " ".join(words[:-2]) if len(words) > 2 else ""
+            for form in morpho_forms:
+                if prefix:
+                    aliases.append(self.normalize_alias(f"{prefix} {form}"))
+                # Короткая форма (только ключевая фраза)
+                aliases.append(self.normalize_alias(form))
+        elif len(words) == 1:
+            # Одно слово — склоняем (например, "Талибан")
+            morpho_forms = self.expand_morphological_forms(words[0])
+            aliases.extend([self.normalize_alias(f) for f in morpho_forms])
+
         # Add common terrorist abbreviations if present
         if "исламское государство" in normalized or "игил" in normalized:
             aliases.extend(["игил", "иг", "isis", "isil", "даиш"])
+            # Склоняем аббревиатуры
+            aliases.extend(["игила", "игилу", "игилом", "игиле"])
         if "аль-каида" in normalized or "аль каида" in normalized:
             aliases.extend(["аль-каида", "аль каида", "al-qaeda", "al qaeda"])
+            # Склоняем
+            aliases.extend(["аль-каиды", "аль-каиде", "аль-каидой", "аль-каиде"])
         if "талибан" in normalized:
             aliases.extend(["талибан", "taliban"])
+            # Формы уже добавлены выше через морфологию
 
         return list(set(aliases))
 
     def _expand_extremist(self, entity_name: str) -> list:
         """
-        Strategy for extremists: full name + morphology only.
-        No single-word extraction to reduce false positives.
+        Strategy for extremists: full name + key phrase morphology with adjective agreement.
+        Example: "Украинская организация Правый сектор" →
+                 [..., "украинская организация правого сектора", "правого сектора", ...]
         """
         normalized = self.normalize_alias(entity_name)
         aliases = [normalized]
 
-        # Add morphological forms of the full name (if Russian)
+        # Add morphological forms of the last 2-3 words (key phrase) with adjective agreement
         words = entity_name.split()
-        if len(words) > 0:
-            # Get morphology for last significant word (usually the key term)
-            last_word = words[-1]
-            morpho_forms = self.expand_morphological_forms(last_word)
+        if len(words) >= 2:
+            # Склоняем последние 2-3 слова как словосочетание (с согласованием прилагательных)
+            # Пример: "Правый сектор" → "правого сектора", "правому сектору"
+            key_phrase = " ".join(words[-2:])  # Последние 2 слова
+            morpho_forms = self.expand_phrase_morphology(key_phrase, max_words=2)
 
-            # Reconstruct full phrases with morphological variants
+            # Добавляем ДВА набора форм:
+            # 1. Полное название с вариантами склонения (с префиксом)
+            # 2. Только ключевая фраза (БЕЗ префикса) — для поиска коротких упоминаний
+            prefix = " ".join(words[:-2]) if len(words) > 2 else ""
             for form in morpho_forms:
-                # Replace last word with morphological form
-                variant_words = words[:-1] + [form]
-                variant = " ".join(variant_words)
-                aliases.append(self.normalize_alias(variant))
+                # Полная форма (если есть префикс)
+                if prefix:
+                    variant_full = f"{prefix} {form}"
+                    aliases.append(self.normalize_alias(variant_full))
+
+                # Короткая форма (только ключевая фраза) — ВСЕГДА добавляем
+                aliases.append(self.normalize_alias(form))
+        elif len(words) == 1:
+            # Одно слово — просто склоняем
+            morpho_forms = self.expand_morphological_forms(words[0])
+            aliases.extend([self.normalize_alias(f) for f in morpho_forms])
 
         return list(set(aliases))
 
