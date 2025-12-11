@@ -260,8 +260,10 @@ class AliasExpander:
         """
         Parse Russian full name into components.
 
+        IMPORTANT: CSV format is "Фамилия Имя Отчество" (Захаров Андрей Вячеславович)
+
         Args:
-            name: Full name string
+            name: Full name string in format "Last First Patronymic"
 
         Returns:
             (first_name, patronymic_or_none, last_name)
@@ -272,14 +274,16 @@ class AliasExpander:
             # Single word: treat as both first and last
             return (parts[0], None, parts[0])
         elif len(parts) == 2:
-            # Two parts: first, last (no patronymic)
-            return (parts[0], None, parts[1])
+            # Two parts: assume Last First (no patronymic)
+            # Return: (First, None, Last)
+            return (parts[1], None, parts[0])
         elif len(parts) == 3:
-            # Three parts: first, patronymic, last
-            return (parts[0], parts[1], parts[2])
+            # Three parts: Last First Patronymic (Захаров Андрей Вячеславович)
+            # Return: (First, Patronymic, Last)
+            return (parts[1], parts[2], parts[0])
         else:
-            # 4+ parts: join first parts, second-to-last as patronymic, last as surname
-            return (" ".join(parts[:-2]), parts[-2], parts[-1])
+            # 4+ parts: assume Last as parts[0], Patronymic as parts[-1], First as middle
+            return (" ".join(parts[1:-1]), parts[-1], parts[0])
 
     def expand_name_orders(
         self,
@@ -320,7 +324,7 @@ class AliasExpander:
         last: str
     ) -> list:
         """
-        Generate initial variants.
+        Generate initial variants with all spacing combinations.
 
         Args:
             first: First name
@@ -336,13 +340,24 @@ class AliasExpander:
         first_initial = first[0] if first else ""
 
         # Single initial variants (FR-002)
+        # А. Захаров / А.Захаров
         variants.append(f"{first_initial}. {last}")
+        variants.append(f"{first_initial}.{last}")
+        # Захаров А.
         variants.append(f"{last} {first_initial}.")
 
         # Double initial variants (FR-003, only if patronymic present)
         if patronymic:
             patronymic_initial = patronymic[0] if patronymic else ""
+            # А. В. Захаров (с пробелами между инициалами)
+            variants.append(f"{first_initial}. {patronymic_initial}. {last}")
+            # А.В. Захаров (без пробела между инициалами, с пробелом перед фамилией)
             variants.append(f"{first_initial}.{patronymic_initial}. {last}")
+            # А.В.Захаров (без пробелов)
+            variants.append(f"{first_initial}.{patronymic_initial}.{last}")
+            # Захаров А. В. (с пробелом между инициалами)
+            variants.append(f"{last} {first_initial}. {patronymic_initial}.")
+            # Захаров А.В. (без пробела между инициалами)
             variants.append(f"{last} {first_initial}.{patronymic_initial}.")
 
         return variants
@@ -440,6 +455,141 @@ class AliasExpander:
             forms.add(form.word.lower())
 
         return list(forms)
+
+    def decline_word_singular(self, word: str, exclude_plural=True, exclude_gender_mismatch=True) -> list:
+        """
+        Склоняет слово по падежам, исключая множественное число и несоответствующий род.
+
+        Args:
+            word: Слово для склонения
+            exclude_plural: Исключить множественное число (по умолчанию True)
+            exclude_gender_mismatch: Исключить формы другого рода (по умолчанию True)
+
+        Returns:
+            Список форм в разных падежах (только единственное число, правильный род)
+        """
+        parsed = self.morph_analyzer.parse(word)
+        if not parsed:
+            return [word.lower()]
+
+        word_parse = parsed[0]
+        forms = set()
+
+        # Определяем род слова
+        base_gender = word_parse.tag.gender
+
+        for form in word_parse.lexeme:
+            # Проверяем критерии фильтрации
+            if exclude_plural and form.tag.number == 'plur':
+                continue  # Пропускаем множественное число
+
+            if exclude_gender_mismatch and base_gender and form.tag.gender and form.tag.gender != base_gender:
+                continue  # Пропускаем неправильный род
+
+            forms.add(form.word.lower())
+
+        return list(forms)
+
+    def expand_initials_with_cases(
+        self,
+        first: str,
+        patronymic: Optional[str],
+        last: str
+    ) -> list:
+        """
+        Генерирует инициалы со склонениями фамилии.
+
+        Пример: А. В. Захаров → А. В. Захарова, А. В. Захарову, А. В. Захаровым, ...
+
+        Args:
+            first: Имя
+            patronymic: Отчество (может быть None)
+            last: Фамилия
+
+        Returns:
+            Список всех вариантов инициалов со склонениями
+        """
+        variants = []
+
+        fi = first[0].lower()
+        pi = patronymic[0].lower() if patronymic else ""
+
+        # Склоняем только фамилию (исключая множественное число и женский род для мужских фамилий)
+        last_forms = self.decline_word_singular(last, exclude_plural=True, exclude_gender_mismatch=True)
+
+        for last_form in last_forms:
+            # Одна инициала
+            variants.append(f"{fi}. {last_form}")
+            variants.append(f"{fi}.{last_form}")
+            variants.append(f"{last_form} {fi}.")
+
+            # Две инициала (если есть отчество)
+            if patronymic:
+                variants.append(f"{fi}. {pi}. {last_form}")
+                variants.append(f"{fi}.{pi}. {last_form}")
+                variants.append(f"{fi}.{pi}.{last_form}")
+                variants.append(f"{last_form} {fi}. {pi}.")
+                variants.append(f"{last_form} {fi}.{pi}.")
+
+        return variants
+
+    def expand_full_name_cases(self, first: str, patronymic: str, last: str) -> list:
+        """
+        Генерирует все падежные формы для формата Ф И О (Захаров Андрей Вячеславович).
+
+        Склоняет каждую часть имени по падежам и соединяет их правильно.
+
+        Args:
+            first: Имя
+            patronymic: Отчество
+            last: Фамилия
+
+        Returns:
+            Список всех падежей в формате "Фамилия Имя Отчество"
+        """
+        # Парсим каждое слово
+        parsed_last = self.morph_analyzer.parse(last)
+        parsed_first = self.morph_analyzer.parse(first)
+        parsed_patronymic = self.morph_analyzer.parse(patronymic)
+
+        if not parsed_last or not parsed_first or not parsed_patronymic:
+            return []
+
+        parsed_last = parsed_last[0]
+        parsed_first = parsed_first[0]
+        parsed_patronymic = parsed_patronymic[0]
+
+        fio_variants = set()
+
+        # Для каждого падежа фамилии
+        for last_form in parsed_last.lexeme:
+            # Пропускаем множественное число
+            if last_form.tag.number == 'plur':
+                continue
+
+            # Пропускаем женский род для мужских фамилий
+            base_gender = parsed_last.tag.gender
+            if base_gender and last_form.tag.gender and last_form.tag.gender != base_gender:
+                continue
+
+            # Находим соответствующий падеж
+            case = last_form.tag.case
+            if not case:
+                continue
+
+            # Склоняем имя в тот же падеж
+            first_inflected = parsed_first.inflect({case})
+            patronymic_inflected = parsed_patronymic.inflect({case})
+
+            if first_inflected and patronymic_inflected:
+                # Проверяем род для имени и отчества
+                if first_inflected.tag.number == 'plur' or patronymic_inflected.tag.number == 'plur':
+                    continue
+
+                variant = f"{last_form.word} {first_inflected.word} {patronymic_inflected.word}"
+                fio_variants.add(variant.lower())
+
+        return list(fio_variants)
 
     def apply_heuristic_fallback(self, full_name: str, morphology_results: list) -> list:
         """
@@ -726,8 +876,11 @@ class AliasExpander:
         """
         Full alias expansion for person names (ФИО).
 
-        CRITICAL FIX: НЕ генерируем склонения для отдельных частей имени.
-        Генерируем только склонения ПОЛНЫХ имен (Имя Фамилия, Имя Отчество Фамилия).
+        FIXES APPLIED:
+        - Генерирует ВСЕ варианты инициалов (с пробелами и без)
+        - Генерирует склонения для форм с инициалами (А. В. Захаровым, А.В. Захарова)
+        - Генерирует склонения для полных форм Ф И О (Захарова Андрея Вячеславовича)
+        - НЕ генерирует множественное число и несоответствующий род
         """
         all_variants = []
 
@@ -738,19 +891,28 @@ class AliasExpander:
         name_order_variants = self.expand_name_orders(first, patronymic, last)
         all_variants.extend(name_order_variants)
 
-        # 2. Initials (FR-002, FR-003)
+        # 2. Initials без склонений (FR-002, FR-003)
         all_variants.extend(self.expand_initials(first, patronymic, last))
 
-        # 3. Morphological forms for FULL NAME ONLY (не для отдельных слов!)
-        # Склоняем только полные варианты имен (2-3 слова), не фамилию/отчество отдельно
+        # 3. Initials СО СКЛОНЕНИЯМИ (А. В. Захаровым, А.В. Захарова и т.д.)
+        all_variants.extend(self.expand_initials_with_cases(first, patronymic, last))
+
+        # 4. Склонения для формата Ф И О (Захаров Андрей Вячеславович)
+        if patronymic:
+            # Генерируем полные формы Ф И О
+            fio_cases = self.expand_full_name_cases(first, patronymic, last)
+            all_variants.extend(fio_cases)
+
+        # 5. Склонения для формата И Ф (Андрей Захаров)
+        # Используем expand_phrase_morphology для двухсловных имен
         for name_variant in name_order_variants:
             words = name_variant.split()
-            if len(words) >= 2:
-                # Склоняем словосочетание (Имя Фамилия или Имя Отчество Фамилия)
-                morpho_forms = self.expand_phrase_morphology(name_variant, max_words=3)
+            if len(words) == 2:
+                # Склоняем двухсловное имя (Андрей Захаров)
+                morpho_forms = self.expand_phrase_morphology(name_variant, max_words=2)
                 all_variants.extend(morpho_forms)
 
-        # 4. Diminutives for first name (FR-005)
+        # 6. Diminutives for first name (FR-005)
         # ТОЛЬКО в комбинации с фамилией, не отдельно
         diminutives = self.expand_diminutives(first)
         for dim in diminutives:
@@ -758,20 +920,20 @@ class AliasExpander:
                 all_variants.append(f"{dim} {patronymic} {last}")
             all_variants.append(f"{dim} {last}")
 
-        # 5. Transliterations (FR-006, FR-007)
+        # 7. Transliterations (FR-006, FR-007)
         # Транслитерируем только полные имена, не отдельные слова
         transliterations = self.expand_transliterations(all_variants)
         all_variants.extend(transliterations)
 
-        # 6. Normalize all variants
+        # 8. Normalize all variants
         normalized_variants = [self.normalize_alias(v) for v in all_variants]
 
-        # 7. Filter out single words (except initials with dots)
+        # 9. Filter out single words (except initials with dots)
         # ЭТО КРИТИЧНО: убираем все однословные алиасы (николаевна, николаевну и т.д.)
         filtered_variants = []
         for v in normalized_variants:
             # Оставляем только:
-            # - Инициалы с точками (а. навальный)
+            # - Инициалы с точками (а. навальный, а.захаров)
             # - Многословные имена (2+ слов)
             if '.' in v:
                 filtered_variants.append(v)
@@ -779,10 +941,10 @@ class AliasExpander:
                 filtered_variants.append(v)
             # Однословные алиасы УДАЛЯЕМ полностью
 
-        # 8. Deduplicate
+        # 10. Deduplicate
         unique_variants = list(set(filtered_variants))
 
-        # 9. Prioritize and truncate
+        # 11. Prioritize and truncate
         final_aliases = self.prioritize_aliases(unique_variants)
 
         return final_aliases
